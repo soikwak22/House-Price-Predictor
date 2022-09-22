@@ -1,0 +1,351 @@
+# Front Matter
+```{r}
+# clean up R environment
+rm(list = ls())
+
+# load all packages here
+library(readr)
+library(tidyverse)
+library(dplyr)
+library(mdsr)
+library(ggplot2)
+library(cluster)
+library(factoextra)
+library(mclust)
+library(mosaic)
+library(modelr)
+library(glmnet)
+# user-defined functions here (if any)
+```
+
+```{r}
+immo_data <- read_csv("immo_data.csv")
+View(immo_data)
+```
+
+
+
+# Data Cleaning
+
+
+## Manually remove obbious erros in Original Data based on German Housing Regulation
+
+### Reference Link 1: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8073340/
+
+### Reference Link 2: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC8073340/table/ijerph-18-04278-t003/?report=objectonly
+```{r}
+Original <- immo_data %>%
+  select(geo_bln, geo_krs, regio3, geo_plz, yearConstructed, livingSpace, noRooms,  noParkSpaces, cellar, balcony, garden, lift, hasKitchen, telekomUploadSpeed, serviceCharge, baseRent, totalRent) %>%
+  na.omit()
+  
+Error_OneRoom <- Original %>%
+  select(noRooms, livingSpace) %>%
+  filter(noRooms == 1, livingSpace < 10)
+
+Error_MultiRooms <- Original %>%
+  select(noRooms, livingSpace) %>%
+  filter(noRooms > 1, livingSpace < 6)
+Error_MultiRooms
+
+Error_Year <- Original %>%
+  select(yearConstructed) %>%
+  filter(yearConstructed > 2021)
+Error_Year
+
+Error_Rent <- Original %>%
+  filter(baseRent == 0 & totalRent == 0) %>%
+  select(serviceCharge, baseRent, totalRent)
+Error_Rent
+
+Original_clean <- Original[!(Original$noRooms == 1 & Original$livingSpace < 10 ) & !(Original$noRooms > 1 & Original$livingSpace < 6 ) & !(Original$yearConstructed > 2021),]
+```
+
+
+# Originial Data Overview
+```{r}
+summary(Original_clean)
+str(Original_clean)
+```
+
+
+# Creat Draft Sample from Originial Data
+```{r}
+pick <- Original_clean %>%
+  rename(State =  geo_bln, District = geo_krs, "City/Town" = regio3, ZipCode = geo_plz, Year = yearConstructed, "LivingSpace[sqm]" = livingSpace, NumRooms = noRooms, NumParkSpaces = noParkSpaces, Cellar = cellar, Balcondy = balcony, Garden = garden, Lift = lift, Kitchen = hasKitchen, "InternetSpeed[Mbps]" = telekomUploadSpeed, "UtilityFee[€]"  = serviceCharge)
+
+Error_baseRent <- pick %>%
+  filter(baseRent == 0)
+Error_baseRent
+
+pick$baseRent[pick$baseRent == 0] <- 530
+
+pick %>%
+  filter(baseRent == 0)
+
+draft <- pick %>%
+  select(State, District, "City/Town", ZipCode, Year, "LivingSpace[sqm]", NumRooms, NumParkSpaces, Cellar, Balcondy, Garden, Lift, Kitchen, `InternetSpeed[Mbps]`, `UtilityFee[€]`, baseRent) %>%
+  mutate_if(is.logical, as.character) %>%
+  rename("BaseRent[€]" = baseRent)
+```
+
+
+# Draft Sample Overview
+```{r}
+summary(draft)
+str(draft)
+```
+
+
+# Testing Sample Reliablity with Bootstrap
+```{r}
+set.seed(123)
+
+sample_size <- nrow(draft)
+
+meanboot <- 1:10000 %>%
+   map_df(
+    ~draft %>%
+     slice_sample(n = sample_size, replace = TRUE) %>% # replace = TRUE is FUNDAMENTAL
+     summarize(MeanRent = mean(`BaseRent[€]`, na.rm = TRUE))
+  ) 
+
+meanboot %>%
+  skim(MeanRent)
+
+ggplot(meanboot, aes(x = MeanRent)) +
+  geom_histogram(aes(y=..density..), colour="black", fill="salmon") +
+  ggtitle("10000 bootstrapped Mean Base Rent[€] among samples of n = 51756")
+```
+
+
+# Confidence Interval for Mean Base Rent
+```{r}
+xbar <- meanboot$MeanRent %>% mean(na.rm = TRUE)
+sdev <- meanboot$MeanRent %>% sd(na.rm=TRUE)
+n <- meanboot %>% nrow()
+serr <- sdev/sqrt(n)
+
+conf_int <- c(xbar - 1.96*serr, xbar + 1.96*serr)
+conf_int
+```
+
+
+# Using Z-scores to identify outliers, remove outliers from Draft Data, create Working Data df
+
+## Reference Link: https://www.statology.org/remove-outliers-r/
+```{r}
+draft_numeric <- draft %>%
+  select(Year, `LivingSpace[sqm]`, NumRooms, NumParkSpaces, `InternetSpeed[Mbps]`, `UtilityFee[€]`, `BaseRent[€]`)
+
+z_scores <- as.data.frame(sapply(draft_numeric, function(draft_numeric) (abs(draft_numeric-mean(draft_numeric))/sd(draft_numeric))))
+
+z_scores_rename <- z_scores %>%
+  rename(Z_Year = Year, Z_LivingSpace = `LivingSpace[sqm]`, Z_Rooms = NumRooms, Z_Park = NumParkSpaces, Z_Internet = `InternetSpeed[Mbps]`, Z_Utility = `UtilityFee[€]`, Z_Rent = `BaseRent[€]`)
+z_scores_rename
+
+draft_z <- draft_numeric %>%
+  cbind(z_scores_rename)
+
+no_outliers <- z_scores_rename[!rowSums(z_scores_rename > 3), ]
+no_outliers
+
+temp <- semi_join(draft_z, no_outliers)
+temp
+
+df <- semi_join(draft, temp)
+df
+
+df[ , -which(names(df) %in% c("Z_Year", "Z_LivingSpace", "Z_Rooms", "Z_Park", "Z_Internet", "Z_Utility", "Z_Rent"))]
+```
+
+
+# Working Data df Overview
+```{r}
+summary(df)
+str(df)
+```
+
+
+# Interactive Map
+```{r}
+AveRent_State <- df %>%
+  select(State, `BaseRent[€]`) %>%
+  group_by(State) %>%
+  summarise(AveRent = mean(`BaseRent[€]`))
+
+AveRent_State
+```
+
+
+# Boxplot
+```{r}
+RentPlot <- boxplot(df$`BaseRent[€]`, xlab = "Base Rent [€] of Flats in German", horizontal = TRUE)
+text(x = boxplot.stats(df$`BaseRent[€]`)$stats, labels = boxplot.stats(df$`BaseRent[€]`)$stats, y = 1.25)
+```
+
+# Unsupervised Learning with Quantitaive Variables
+
+# Principal Component Analysis (PCA)
+
+
+## Perform principal component analysis using the command prcomp with the appropriate attributes.
+```{r}
+df_unsupervised <- df %>%
+  select(Year, `LivingSpace[sqm]`, NumRooms, NumParkSpaces, `InternetSpeed[Mbps]`, `UtilityFee[€]`)
+
+pca.res <- df_unsupervised %>% 
+  prcomp(scale = TRUE)
+
+loadings <- pca.res$rotation 
+
+score_mat <- pca.res$x
+
+pca.res$rotation
+```
+
+## How much is the variance explained by each PC?
+```{r}
+pca.var = pca.res$sdev^2
+var.ratio = pca.var/sum(pca.var)
+var.ratio
+```
+
+
+## How many PCs should I select to collect at least the 80% of the explained variance? Show it on a plot with an horizontal line on the 80% (0.8).
+
+## Comulative PVE
+```{r}
+pve <- get_eig(pca.res)
+pve
+pve %>%
+  ggplot(aes(x = 1:6, y = cumulative.variance.percent)) + 
+  geom_line() + 
+  geom_point() +
+  geom_hline(yintercept = 80, color = "blue") +
+  xlab("Principal Component") + 
+  ylab("Proportion of Variance Explained") + 
+  ggtitle("Scree Plot of Principal Components for df") 
+```
+
+## Scree Plot
+```{r}
+fviz_screeplot(pca.res, main='Scree Plot for Rent') +
+  geom_vline(xintercept = 2, color = "orange") +
+  geom_vline(xintercept = 4, color = "red")
+```
+
+
+## keep 4 PCs (80%) and get new matrix of scores
+```{r}
+sel_pcs <- 1:4
+red_mat <- score_mat[,sel_pcs]
+```
+
+
+##  Loadings interpretation
+
+# Biplot
+```{r}
+pca.res %>%
+  fviz_pca_var(axes = c(1,2), # PCs to consdier
+             col.var = "contrib", # Color by contributions to the PC
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping
+             )    
+```
+# A general view of the weight of each variables for the PCs with barplot
+```{r}
+# transforming loadings to dataframe and adding a 'discipline' columns
+loadings <- loadings %>%
+  as.data.frame() %>%
+  mutate(discipline = rownames(loadings))
+
+# passing to a narrow/long version
+long_loadings <- loadings %>%
+  select(c(1:4, 7)) %>%
+  pivot_longer(-discipline, names_to ="PC", values_to="weight")
+
+# plotting with facet
+ggplot(long_loadings, aes(x=discipline, y=weight))+
+  geom_bar(stat='identity', fill="forest green")+
+  facet_wrap(~PC) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+# Supervised Learning with both Quantitative & Categorical Predictors
+
+# Multiple Linear Regression with both Quantitative & Categorical Predictors
+
+## Prepare the data
+```{r}
+df_supervised <- df[-c(1:4)]
+
+df_supervised[, c(5:9)] <- ifelse(df_supervised[, c(5:9)] == 'TRUE', 1, 0)
+df_supervised_rename <- df_supervised %>%
+  rename(LivingSpace = `LivingSpace[sqm]`, InternetSpeed = `InternetSpeed[Mbps]`, UtilityFee = `UtilityFee[€]`, BaseRent = `BaseRent[€]`)
+
+str(df_supervised_rename)
+```
+
+## Multiple Linear Regression with all 11 regressors
+```{r}
+mod <- lm(BaseRent ~ ., data = df_supervised_rename)
+summary(mod)
+```
+
+## Best Subset Selection
+
+## we have 11 possible regressors, we create 2^11 = 2048 possible models and we look for the best one
+```{r}
+## We output the summary based on best subset
+regfit.full = regsubsets(BaseRent ~ ., data = df_supervised_rename,  nvmax = 11, method="exhaustive")
+summary(regfit.full)
+```
+
+
+```{r}
+reg.summary <- summary(regfit.full) #get the summary
+
+data.frame(
+  Adj.R2 = which.max(reg.summary $adjr2),
+  CP = which.min(reg.summary $cp),
+  BIC = which.min(reg.summary $bic)
+)
+
+par(mfrow=c(2,2))
+#rss plot -  NOT USEFUL
+plot(reg.summary$rss ,xlab="Number of Variables ",ylab="RSS",type="l")
+
+#adjr2 plot
+plot(reg.summary$adjr2 ,xlab="Number of Variables ", ylab="Adjusted RSq",type="l")
+max_adjr2 <- which.max(reg.summary$adjr2)
+points(max_adjr2,reg.summary$adjr2[max_adjr2], col="red",cex=2,pch=20)
+
+# AIC criterion (Cp) to minimize
+plot(reg.summary$cp ,xlab="Number of Variables ",ylab="Cp", type='l')
+min_cp <- which.min(reg.summary$cp )
+points(min_cp, reg.summary$cp[min_cp],col="red",cex=2,pch=20)
+
+# BIC criterion to minimize
+plot(reg.summary$bic ,xlab="Number of Variables ",ylab="BIC",type='l')
+min_bic <- which.min(reg.summary$bic)
+points(min_bic,reg.summary$bic[min_bic],col="red",cex=2,pch=20)
+```
+
+## Double_Check
+```{r}
+cbind( 
+    CP     = summary(regfit.full)$cp,
+    r2     = summary(regfit.full)$rsq,
+    Adj_r2 = summary(regfit.full)$adjr2,
+    BIC    =summary(regfit.full)$bic
+)
+
+```
+
+## New Model with 9 Regressors
+```{r}
+mod_adjusted <- lm(BaseRent ~ Year + LivingSpace + NumRooms + Cellar + Balcondy + Lift + Kitchen + InternetSpeed + UtilityFee, data = df_supervised_rename)
+summary(mod_adjusted)
+```
+
